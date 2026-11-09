@@ -1,0 +1,71 @@
+name: resolve-registry
+description: >-
+  Resolve a from/to cluster-leaf pair to their registry login servers and the image-copy mode,
+  using the platform-owned hierarchical catalog.yaml co-located in this repo (the single source of
+  truth for per-cluster facts). A cluster's effective facts are the deep-merge of
+  defaults < env < cloud < region (deepest wins); `.registry` is read from that merged map.
+inputs:
+  from_cluster:
+    description: Source cluster leaf <env>/<cloud>/<region> (e.g. sbx/azure/centralus)
+    required: true
+  to_cluster:
+    description: Target cluster leaf <env>/<cloud>/<region> (e.g. dev/azure/centralus)
+    required: true
+outputs:
+  from_reg:
+    description: Source registry login server host
+    value: ${{ steps.resolve.outputs.from_reg }}
+  to_reg:
+    description: Target registry login server host
+    value: ${{ steps.resolve.outputs.to_reg }}
+  mode:
+    description: Image-copy mode — acr | ecr | none (none when source and target share a registry)
+    value: ${{ steps.resolve.outputs.mode }}
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        FROM: ${{ inputs.from_cluster }}
+        TO: ${{ inputs.to_cluster }}
+      run: |
+        set -euo pipefail
+        # catalog.yaml sits at the repo root, two levels up from actions/resolve-registry/.
+        CATALOG="${GITHUB_ACTION_PATH}/../../catalog.yaml"
+        [ -f "$CATALOG" ] || { echo "::error::catalog not found at $CATALOG"; exit 1; }
+
+        # Effective fact for a cluster = the value defined at the DEEPEST level on its path
+        # (region > cloud > env > defaults). No map-merge needed: collect the key at each level,
+        # drop nulls, take the first.
+        fact() { # <env> <cloud> <region> <key>
+          ENV="$1" CLOUD="$2" REGION="$3" KEY="$4" yq -r '
+            [ .environments[strenv(ENV)].clouds[strenv(CLOUD)].regions[strenv(REGION)][strenv(KEY)],
+              .environments[strenv(ENV)].clouds[strenv(CLOUD)][strenv(KEY)],
+              .environments[strenv(ENV)][strenv(KEY)],
+              .defaults[strenv(KEY)]
+            ] | map(select(. != null)) | .[0] // ""
+          ' "$CATALOG"
+        }
+
+        IFS=/ read -r FE FC FR <<<"$FROM"
+        IFS=/ read -r TE TC TR <<<"$TO"
+        FROM_REG="$(fact "$FE" "$FC" "$FR" registry)"
+        TO_REG="$(fact "$TE" "$TC" "$TR" registry)"
+        [ -n "$FROM_REG" ] || { echo "::error::no registry for source $FROM in catalog.yaml"; exit 1; }
+        [ -n "$TO_REG" ]   || { echo "::error::no registry for target $TO in catalog.yaml — onboard the cluster's registry (add regions.<region>.registry) first"; exit 1; }
+
+        if [ "$FROM_REG" = "$TO_REG" ]; then
+          MODE=none   # same registry (e.g. geo-replicated prd): nothing to copy
+        else
+          case "$TC" in
+            azure) MODE=acr ;;
+            aws)   MODE=ecr ;;
+            *)     echo "::error::no registry promotion defined for cloud '$TC'"; exit 1 ;;
+          esac
+        fi
+        {
+          echo "from_reg=$FROM_REG"
+          echo "to_reg=$TO_REG"
+          echo "mode=$MODE"
+        } >> "$GITHUB_OUTPUT"
